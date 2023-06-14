@@ -1,7 +1,8 @@
 package main
 
 import (
-	"io"
+	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -13,12 +14,13 @@ import (
 )
 
 type SshFile struct {
-	w      io.Writer
-	donech chan struct{}
-	id     int
+	fileContents []byte
+	isDone       bool
+	id           int
+	doneCh       chan bool
 }
 
-var files = map[int]chan SshFile{}
+var filesMap = make(map[int]SshFile)
 
 func main() {
 
@@ -29,15 +31,24 @@ func main() {
 
 	ssh.Handle(func(s ssh.Session) {
 		sessionId := rand.Intn(math.MaxInt32)
-		files[sessionId] = make(chan SshFile)
-		log.Printf("Session id is %d\n", sessionId)
-		file := <-files[sessionId]
-		file.id = sessionId
-		_, err := io.Copy(file.w, s)
-		if err != nil {
-			log.Printf("Failed to copy data, %s\n", err)
+		s.Write([]byte(fmt.Sprintf("Session id is %d\n", sessionId)))
+		file := SshFile{
+			isDone: false,
+			id:     sessionId,
+			doneCh: make(chan bool, 1),
 		}
-		close(file.donech)
+		content, err := ioutil.ReadAll(s)
+		if err != nil {
+			// Handle the error
+			// For example, you can log the error or return an error message to the client
+			s.Write([]byte(err.Error()))
+		}
+		file.fileContents = content
+		filesMap[sessionId] = file
+		file.isDone = true
+		filesMap[sessionId].doneCh <- true
+		close(file.doneCh)
+		s.Write([]byte("Done serving file\n"))
 
 	})
 
@@ -52,7 +63,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("Missing id parameter"))
 		return
 	}
-	fileChan, ok := files[sessionId]
+	file, ok := filesMap[sessionId]
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		notFoundFile, err := os.ReadFile("./404.html")
@@ -62,10 +73,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.Write(notFoundFile)
 		return
 	}
-	donech := make(chan struct{})
-	fileChan <- SshFile{
-		w:      w,
-		donech: donech,
+	if !file.isDone {
+		<-file.doneCh
 	}
-	<-donech
+	w.WriteHeader(http.StatusOK)
+	w.Write(file.fileContents)
+	fmt.Println("Served file")
 }
